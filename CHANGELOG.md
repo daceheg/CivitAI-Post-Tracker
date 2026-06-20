@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+- Follower and account-standing tracking. Each tracker run records a daily snapshot of follower count, creator leaderboard rank, and moderation "Account Standing" (active strikes / points) from `user.getCreator` and `strike.getMyStrikeSummary`.
+- A **Followers** dashboard workspace showing current followers, the change since the previous snapshot, creator rank, account standing, and the posts published in that interval — so a follower change can be attributed to specific posts.
+- `account_standing_snapshots` table and `options.enable_follower_tracking` config flag (default on; requires an API key).
+
 ## v10.6.0
 
 ### Added

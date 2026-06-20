@@ -761,3 +761,147 @@ COLLECTION_SECTION_CSS = """
 @media (max-width:900px){.collection-board-grid{grid-template-columns:1fr}.collection-event-card{grid-template-columns:68px minmax(0,1fr)}.collection-event-status{grid-column:2;justify-self:start}.collection-panel-head{flex-direction:column}.collection-panel-head span{text-align:left}}
 </style>
 """
+
+
+# ------------------------------
+# Follower / account-standing section (PR-4)
+# ------------------------------
+
+def _fmt_signed(value: Optional[int]) -> str:
+    if value is None:
+        return "—"
+    return f"+{value}" if value > 0 else str(value)
+
+
+def get_follower_dashboard_data(db_path: str, history_limit: int = 60) -> Dict[str, Any]:
+    """Latest follower snapshot, delta vs the previous one, and posts published
+    in that interval (so a follower jump can be attributed to specific posts)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        if not _table_has_columns(conn, "account_standing_snapshots", ["follower_count", "captured_at"]):
+            return {"ok": False, "reason": "no_snapshots"}
+
+        rows = _fetch_all(
+            conn,
+            """
+            SELECT captured_at, follower_count, leaderboard_rank,
+                   active_strikes, total_active_points
+            FROM account_standing_snapshots
+            ORDER BY captured_at DESC
+            LIMIT ?
+            """,
+            (int(history_limit),),
+        )
+        if not rows:
+            return {"ok": False, "reason": "no_snapshots"}
+
+        latest = rows[0]
+        previous = rows[1] if len(rows) > 1 else None
+        follower_delta = None
+        attributed_posts: List[tuple] = []
+        if previous is not None and latest[1] is not None and previous[1] is not None:
+            follower_delta = int(latest[1]) - int(previous[1])
+            # Posts published between the previous and latest snapshots.
+            attributed_posts = _fetch_all(
+                conn,
+                """
+                SELECT post_id, MAX(title), MAX(published_at)
+                FROM post_snapshots
+                WHERE published_at IS NOT NULL
+                  AND published_at > ? AND published_at <= ?
+                GROUP BY post_id
+                ORDER BY MAX(published_at) DESC
+                LIMIT 10
+                """,
+                (previous[0], latest[0]),
+            )
+
+        return {
+            "ok": True,
+            "captured_at": latest[0],
+            "follower_count": latest[1],
+            "follower_delta": follower_delta,
+            "leaderboard_rank": latest[2],
+            "active_strikes": latest[3],
+            "total_active_points": latest[4],
+            "snapshot_count": len(rows),
+            "history": [(r[0], r[1]) for r in reversed(rows)],
+            "attributed_posts": attributed_posts,
+        }
+    except sqlite3.OperationalError as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+
+
+def render_follower_section_html(
+    db_path: str,
+    view_host: str = "",
+    time_formatter: Optional[Callable[[Optional[str]], str]] = None,
+) -> str:
+    data = get_follower_dashboard_data(db_path)
+    if not data.get("ok"):
+        if data.get("reason") == "no_snapshots":
+            return (
+                "<div class='feature-note'>No follower snapshots yet. "
+                "Follower tracking records one snapshot per run once an API key is set.</div>"
+            )
+        return f"<div class='feature-note'>{_fmt(data.get('error'))}</div>"
+
+    standing = "Clear" if (data.get("active_strikes") or 0) == 0 else f"{data['active_strikes']} active strike(s)"
+    kpis = "".join([
+        _collection_metric("Followers", data.get("follower_count"),
+                           f"Change since last snapshot: {_fmt_signed(data.get('follower_delta'))}"),
+        _collection_metric("Creator rank", data.get("leaderboard_rank"), "Leaderboard position"),
+        _collection_metric("Account standing", standing,
+                           f"Strike points: {_fmt(data.get('total_active_points'))}"),
+        _collection_metric("Snapshots", data.get("snapshot_count"),
+                           f"Latest: {_fmt_time(data.get('captured_at'), time_formatter)}"),
+    ])
+
+    posts = data.get("attributed_posts") or []
+    if posts and data.get("follower_delta"):
+        items = "".join(
+            "<div class='follower-attrib-row'>"
+            f"<span class='follower-attrib-post'>{_post_link(view_host, int(pid))}</span>"
+            f"<span class='follower-attrib-title'>{_fmt(title)}</span>"
+            f"<span class='follower-attrib-time'>{_fmt_time(pub, time_formatter)}</span>"
+            "</div>"
+            for pid, title, pub in posts
+        )
+        attrib = (
+            "<div class='follower-attrib'>"
+            f"<h4>Posts published this interval ({len(posts)})</h4>"
+            f"<div class='follower-attrib-list'>{items}</div>"
+            "<div class='follower-attrib-note'>Follower change above coincides with these "
+            "posts; treat as correlation, not proof.</div>"
+            "</div>"
+        )
+    else:
+        attrib = (
+            "<div class='follower-attrib-empty'>No new posts published between the last two "
+            "snapshots, or not enough snapshots yet to attribute a follower change.</div>"
+        )
+
+    return (
+        "<div class='follower-overview'>"
+        f"<div class='collection-kpis'>{kpis}</div>"
+        f"{attrib}"
+        "</div>"
+    )
+
+
+FOLLOWER_SECTION_CSS = """
+<style>
+.follower-overview{overflow:visible}
+.follower-attrib{margin-top:16px;border:1px solid var(--border);background:#0d1528;border-radius:14px;padding:14px}
+.follower-attrib h4{margin:0 0 12px;font-size:16px}
+.follower-attrib-list{display:flex;flex-direction:column;gap:8px}
+.follower-attrib-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;border:1px solid #263353;background:#10182b;border-radius:10px;padding:8px 10px}
+.follower-attrib-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.follower-attrib-time{color:var(--muted);font-size:12px;white-space:nowrap}
+.follower-attrib-note{margin-top:10px;color:var(--muted);font-size:12px}
+.follower-attrib-empty{margin-top:16px;border:1px dashed var(--border);border-radius:12px;padding:14px;color:var(--muted);font-size:13px}
+@media (max-width:900px){.follower-attrib-row{grid-template-columns:auto minmax(0,1fr)}.follower-attrib-time{grid-column:2}}
+</style>
+"""

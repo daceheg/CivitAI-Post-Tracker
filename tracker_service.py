@@ -17,8 +17,15 @@ import requests
 
 from app_info import APP_TITLE, APP_VERSION
 from buzz_ingest import run_b2_1_ingest
+from follower_ingest import run_follower_ingest
 from engagement_correlation import run_b2_2_correlation
-from engagement_dashboard import COLLECTION_SECTION_CSS, render_collection_dashboard_section, render_collection_tables_html
+from engagement_dashboard import (
+    COLLECTION_SECTION_CSS,
+    FOLLOWER_SECTION_CSS,
+    render_collection_dashboard_section,
+    render_collection_tables_html,
+    render_follower_section_html,
+)
 
 from config_utils import DEFAULT_POLL_MINUTES, load_yaml_config, deep_get, choose, normalize_poll_minutes, read_api_key
 
@@ -2345,6 +2352,7 @@ def render_dashboard(
         else ""
     )
     collection_tables_html = render_collection_tables_html(db_path, view_host=view_host, time_formatter=tz_helper.fmt_dt) if db_path else ""
+    follower_section_html = render_follower_section_html(db_path, view_host=view_host, time_formatter=tz_helper.fmt_dt) if db_path else ""
 
     known_rows = [r for r in current_posts if r["stats_known"]]
     by_total_reactions = sorted(known_rows, key=lambda r: (int(r["reaction_total"] or 0), int(r["heart_count"] or 0), int(r["post_id"])), reverse=True)[:15]
@@ -3341,6 +3349,7 @@ def render_dashboard(
     parts.append(f"<title>{html.escape(APP_TITLE)}</title>")
     parts.append(f"<style>{css}</style>")
     parts.append(COLLECTION_SECTION_CSS)
+    parts.append(FOLLOWER_SECTION_CSS)
     parts.append(
         f"<script>function refreshNow(){{location.reload();}}setInterval(function(){{location.reload();}}, {refresh_seconds*1000});"
         "document.addEventListener('DOMContentLoaded', function(){"
@@ -3565,6 +3574,14 @@ def render_dashboard(
                 "id": "collections",
                 "title": "Collections",
                 "html": collection_tables_html,
+            }
+        )
+    if follower_section_html:
+        analytics_sections.append(
+            {
+                "id": "followers",
+                "title": "Followers",
+                "html": follower_section_html,
             }
         )
     analytics_sections.extend(
@@ -3830,6 +3847,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "api_key": api_key,
         "api_key_file": api_key_file,
         "enable_buzz_ingest": bool(deep_get(cfg, "options.enable_buzz_ingest", True)),
+        "enable_follower_tracking": bool(deep_get(cfg, "options.enable_follower_tracking", True)),
         "buzz_account_type": deep_get(cfg, "collection_tracking.account_type", "blue"),
         "buzz_backfill_days": deep_get(cfg, "collection_tracking.backfill_days", 60),
         "buzz_overlap_hours": deep_get(cfg, "collection_tracking.overlap_hours", 24),
@@ -3966,6 +3984,7 @@ def _resolve_runtime_from_config_dict(config: Dict[str, Any], config_path: str =
         "api_key": api_key,
         "api_key_file": api_key_file,
         "enable_buzz_ingest": bool(deep_get(cfg, "options.enable_buzz_ingest", True)),
+        "enable_follower_tracking": bool(deep_get(cfg, "options.enable_follower_tracking", True)),
         "buzz_account_type": deep_get(cfg, "collection_tracking.account_type", "blue"),
         "buzz_backfill_days": deep_get(cfg, "collection_tracking.backfill_days", 60),
         "buzz_overlap_hours": deep_get(cfg, "collection_tracking.overlap_hours", 24),
@@ -4104,6 +4123,17 @@ def run_collection_once(
             service_result["engagement_correlated_events"] = 0
             service_result["engagement_distinct_images"] = 0
             service_result["engagement_distinct_posts"] = 0
+
+        # Follower / account-standing snapshot (PR-4). Best-effort: never blocks
+        # the post-tracking run. One row per UTC day (deduped in follower_ingest).
+        follower_summary: Dict[str, Any] = {"ok": False, "disabled": True}
+        if bool(runtime.get("enable_follower_tracking", True)) and runtime.get("api_key"):
+            follower_summary = run_follower_ingest(runtime, runtime["db_path"])
+        else:
+            follower_summary["reason"] = (
+                "API key required" if not runtime.get("api_key") else "disabled by config"
+            )
+        service_result["follower_ingest"] = follower_summary
 
         try:
             conn = db_connect(runtime["db_path"])

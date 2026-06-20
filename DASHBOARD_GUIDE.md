@@ -94,6 +94,21 @@ The Collections workspace uses compact cards instead of a stack of separate tabl
 
 Clicking a collection card opens the same detail drawer pattern used by the Performance tab, with image/post links and compact collection context.
 
+## Followers
+
+The Followers tab tracks account-level growth and standing over time. Each tracker run records one snapshot per day (UTC) when an API key is configured.
+
+The cards show:
+
+- current follower count, with the change since the previous snapshot;
+- creator leaderboard rank;
+- account standing — "Clear", or the number of active moderation strikes and points;
+- how many snapshots have been collected and when the latest was taken.
+
+Below the cards, **Posts published this interval** lists the posts whose publish time falls between the last two snapshots. This is the intended use: when followers jump, you can see which posts went out in that window. Treat it as correlation, not proof — a follower change can come from many sources, and short snapshot intervals make attribution noisier.
+
+Follower tracking needs an API key and `options.enable_follower_tracking` (on by default). With no snapshots yet, the tab shows a short notice instead of cards.
+
 ## Timing
 
 The Timing tab starts with a compact board for scanning:

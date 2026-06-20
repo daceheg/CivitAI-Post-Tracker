@@ -1415,5 +1415,94 @@ class DashboardSmokeTests(unittest.TestCase):
         self.assertNotIn("<table", rendered)
 
 
+class FollowerTrackingSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.db = str(smoke_path("follower", ".db"))
+
+    def test_parse_creator_stats_uses_confirmed_shape(self):
+        import follower_ingest as fi
+
+        creator = {
+            "stats": {
+                "followerCountAllTime": 1234,
+                "reactionCountAllTime": 50,
+                "uploadCountAllTime": 12,
+                "generationCountAllTime": 7,
+            },
+            "rank": {"leaderboardRank": 42},
+        }
+        parsed = fi.parse_creator_stats(creator)
+        self.assertEqual(parsed["follower_count"], 1234)
+        self.assertEqual(parsed["reaction_count"], 50)
+        self.assertEqual(parsed["leaderboard_rank"], 42)
+
+    def test_parse_tolerates_missing_fields(self):
+        import follower_ingest as fi
+
+        parsed = fi.parse_creator_stats({})
+        self.assertIsNone(parsed["follower_count"])
+        self.assertIsNone(parsed["leaderboard_rank"])
+        strike = fi.parse_strike_summary({"activeStrikes": 0, "totalActivePoints": 0})
+        self.assertEqual(strike["active_strikes"], 0)
+
+    def test_snapshot_write_and_daily_dedupe(self):
+        import follower_ingest as fi
+
+        fields = {"follower_count": 100, "leaderboard_rank": 5}
+        self.assertTrue(fi.write_snapshot(self.db, fields, captured_at="2026-06-19T08:00:00Z"))
+        # second write same UTC day -> deduped (no new row)
+        self.assertFalse(fi.write_snapshot(self.db, fields, captured_at="2026-06-19T20:00:00Z"))
+        conn = sqlite3.connect(self.db)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM account_standing_snapshots").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)
+
+    def test_run_follower_ingest_skips_without_api_key(self):
+        import follower_ingest as fi
+
+        summary = fi.run_follower_ingest({"username": "anyone"}, self.db)
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary.get("reason"), "API key required")
+        self.assertFalse(Path(self.db).exists())
+
+    def test_dashboard_section_shows_delta_and_correlates_posts(self):
+        import follower_ingest as fi
+        from engagement_dashboard import get_follower_dashboard_data, render_follower_section_html
+
+        fi.write_snapshot(self.db, {"follower_count": 100, "leaderboard_rank": 9}, captured_at="2026-06-18T00:00:00Z")
+        fi.write_snapshot(self.db, {"follower_count": 137, "leaderboard_rank": 7}, captured_at="2026-06-19T00:00:00Z")
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS post_snapshots "
+                "(id INTEGER PRIMARY KEY, post_id INTEGER, title TEXT, published_at TEXT, captured_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO post_snapshots(post_id,title,published_at,captured_at) VALUES (?,?,?,?)",
+                (777, "Interval post", "2026-06-18T12:00:00Z", "2026-06-19T00:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        data = get_follower_dashboard_data(self.db)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["follower_delta"], 37)
+        self.assertEqual(len(data["attributed_posts"]), 1)
+
+        rendered = render_follower_section_html(self.db, view_host="https://civitai.red")
+        self.assertIn("Followers", rendered)
+        self.assertIn("+37", rendered)
+        self.assertIn("posts/777", rendered)
+
+    def test_dashboard_section_handles_no_snapshots(self):
+        from engagement_dashboard import render_follower_section_html
+
+        rendered = render_follower_section_html(self.db)
+        self.assertIn("No follower snapshots yet", rendered)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
