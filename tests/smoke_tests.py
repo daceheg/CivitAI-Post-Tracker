@@ -42,6 +42,7 @@ from tracker_service import (
     normalize_image,
     normalize_post,
     render_dashboard,
+    utc_now,
     write_dashboard_html,
 )
 from update_manager import (
@@ -1250,6 +1251,57 @@ class DashboardSmokeTests(unittest.TestCase):
         self.assertTrue(rows[0]["period_week"])
         self.assertTrue(rows[0]["period_month"])
         self.assertTrue(rows[0]["period_year"])
+
+    def test_recent_post_on_previous_calendar_day_still_matches_period_day(self) -> None:
+        # Regression: period_day must be a rolling 24h window, not a calendar-date
+        # match. A post published a couple hours ago that happens to fall on the
+        # previous local calendar day (e.g. when "now" is just after local midnight)
+        # must still count as period_day. Construct the published_at deterministically
+        # so the calendar date differs from today regardless of when this test runs.
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+
+        tz_helper = TimezoneHelper("UTC")
+        now_local = utc_now().astimezone(tz_helper.tz)
+        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        # 30 minutes before local midnight: always on the *previous* calendar date,
+        # and within the rolling 24h window as long as it is now before 23:30 local.
+        # Skip the rare <30min sliver at end of day where it would not be within 24h.
+        if now_local - local_midnight >= timedelta(hours=23, minutes=30):
+            self.skipTest("within 30 min of local midnight; 24h window edge not applicable")
+        published_local = local_midnight - timedelta(minutes=30)
+        self.assertNotEqual(published_local.date(), now_local.date())  # genuinely "yesterday"
+        published_at = published_local.astimezone(timezone.utc).isoformat()
+        captured_at = now_local.astimezone(timezone.utc).isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO post_snapshots (
+                post_id, username, title, published_at, captured_at,
+                source_host, source_kind, stats_known,
+                like_count, heart_count, laugh_count, cry_count, comment_count,
+                reaction_total, engagement_total
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1004, "tester", "Late-night post", published_at, captured_at, "https://civitai.red", "test", 1, 1, 0, 0, 0, 0, 1, 1),
+        )
+        conn.commit()
+
+        rows = build_post_performance_rows(
+            conn,
+            get_current_posts(conn),
+            load_snapshots_by_post(conn),
+            load_post_deltas(conn),
+            tz_helper,
+        )
+        conn.close()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["post_id"], 1004)
+        self.assertEqual(rows[0]["reaction_today"], 0)  # no deltas; relies on rolling-window publish
+        self.assertTrue(rows[0]["period_day"])
+        self.assertTrue(rows[0]["period_week"])
 
     def test_image_enrichment_keeps_preview_urls(self) -> None:
         payload = make_image_payload(username="tester")

@@ -124,7 +124,7 @@ Removing the key does not hide rows already stored in the local database. It onl
 
 ## Time And Freshness
 
-Dashboard periods use the configured local timezone.
+Dashboard periods use the configured local timezone. The Day, Week, Month, and Year filters are rolling windows ending at the current time (last 24 hours, 7 days, 30 days, 365 days) — not calendar boundaries.
 
 The header includes a `generated ...` timestamp. If the dashboard looks stale, run the tracker again and confirm that timestamp changed.
 

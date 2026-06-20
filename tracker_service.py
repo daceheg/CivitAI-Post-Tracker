@@ -1357,6 +1357,7 @@ def build_post_performance_rows(
 ) -> List[Dict[str, Any]]:
     now_local = utc_now().astimezone(tz_helper.tz)
     today_date = now_local.date()
+    day_cutoff = now_local - timedelta(hours=24)
     week_cutoff = now_local - timedelta(days=7)
     month_cutoff = now_local - timedelta(days=30)
     year_cutoff = now_local - timedelta(days=365)
@@ -1447,7 +1448,7 @@ def build_post_performance_rows(
             if age_days > 0:
                 reactions_per_day = reaction_total / max(age_days, 1 / 24)
 
-        published_today = bool(published_local is not None and published_local.date() == today_date)
+        published_today = bool(published_local is not None and published_local >= day_cutoff)
         published_week = bool(published_local is not None and published_local >= week_cutoff)
         published_month = bool(published_local is not None and published_local >= month_cutoff)
         published_year = bool(published_local is not None and published_local >= year_cutoff)

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Dashboard **Day** period filter now uses a rolling 24-hour window, matching the Week/Month/Year filters. Brand-new posts published shortly before local midnight are no longer dropped from the Day view at the day boundary.
+
 ## v10.6.0
 
 ### Added
