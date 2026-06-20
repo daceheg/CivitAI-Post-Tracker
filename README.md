@@ -34,7 +34,7 @@ The source code is licensed under the MIT License. That license grants broad rig
 
 ## Requirements
 
-- Windows is the primary target.
+- Windows is the primary target for the packaged EXE. Source mode also runs on Linux and macOS — see [Running on Linux](#running-on-linux).
 - Python 3.11 or newer for source mode and local builds.
 - A CivitAI API key is recommended and required for collection tracking.
 - Desktop fonts are bundled with the app; users do not need to install them separately.
@@ -87,6 +87,46 @@ For direct development troubleshooting:
 ```
 
 `launch_tracker.pyw` is the supported no-console source launcher. The `.bat` launchers are fallback tools for setup and startup diagnostics.
+
+## Running on Linux
+
+Source mode is pure Python (`requests` + Tk-based UI), so the tracker runs on Linux and macOS as well. The `.bat`/`.pyw` launchers are Windows conveniences; on other platforms use the cross-platform launcher.
+
+Install dependencies (a virtualenv is recommended):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+The desktop UI uses Tk. On minimal distros, install the system Tk bindings (the Python `tkinter` module is not bundled by `pip`):
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install python3-tk
+```
+
+Launch the desktop app:
+
+```bash
+python civitai_tracker.py            # same flags as the .pyw launcher
+python civitai_tracker.py --minimized
+```
+
+`civitai_tracker.py` is the supported cross-platform source launcher. It accepts the same arguments as `launch_tracker.pyw` (`--minimized`, `--setup`, `--version`) and uses a project-local `.venv` if one is present.
+
+> **Tray caveat.** The system-tray icon relies on `pystray`, whose behavior varies across desktop environments. It works on most X11 setups; some Wayland sessions do not expose a legacy tray, in which case the icon may be missing while the app still runs normally.
+
+### Headless / server use (no GUI)
+
+For servers or containers without a display, run the tracker without the desktop UI and serve the generated dashboard:
+
+```bash
+python tracker_service.py --export-analytics
+```
+
+This writes the analytics dataset and refreshes `dashboard.html` without opening a window. See [Analytics Export](#analytics-export) and `DASHBOARD_GUIDE.md` for details. Updates on Linux are done through Git (see [Updates](#updates)); the Windows-only auto-apply updater is not used.
 
 ## Quick Start: EXE Mode
 

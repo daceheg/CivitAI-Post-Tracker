@@ -82,7 +82,7 @@ class TimezoneHelper:
         if ZoneInfo is None:
             raise RuntimeError(
                 "IANA timezone support is unavailable in this Python build. "
-                "On Windows, install it with: python -m pip install tzdata"
+                "Install the time zone database with: python -m pip install tzdata"
             )
 
         try:
@@ -90,7 +90,7 @@ class TimezoneHelper:
         except Exception as exc:
             raise RuntimeError(
                 f"No time zone found with key {tz_name!r}. "
-                "On Windows, install it with: python -m pip install tzdata"
+                "Install the time zone database with: python -m pip install tzdata"
             ) from exc
 
     def parse_iso(self, dt_str: Optional[str]) -> Optional[datetime]:

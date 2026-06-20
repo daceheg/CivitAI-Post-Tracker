@@ -41,12 +41,19 @@ def _show_error(message: str) -> None:
 
 
 def _add_local_venv_site(base_dir: Path) -> None:
-    venv_site = base_dir / ".venv" / "Lib" / "site-packages"
-    if venv_site.exists():
-        site.addsitedir(str(venv_site))
-    venv_scripts = base_dir / ".venv" / "Scripts"
-    if venv_scripts.exists():
-        os.environ["PATH"] = str(venv_scripts) + os.pathsep + os.environ.get("PATH", "")
+    venv = base_dir / ".venv"
+    if not venv.exists():
+        return
+    # Windows lays the venv out as Lib/site-packages + Scripts; POSIX uses
+    # lib/pythonX.Y/site-packages + bin. Add whichever exists.
+    candidates = [venv / "Lib" / "site-packages"]
+    candidates.extend(sorted(venv.glob("lib/python*/site-packages")))
+    for venv_site in candidates:
+        if venv_site.exists():
+            site.addsitedir(str(venv_site))
+    for bin_dir in (venv / "Scripts", venv / "bin"):
+        if bin_dir.exists():
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
 
 
 def main() -> int:

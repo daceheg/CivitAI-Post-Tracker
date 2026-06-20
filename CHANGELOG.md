@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+- Cross-platform source-mode launcher `civitai_tracker.py` for Linux and macOS, accepting the same arguments as `launch_tracker.pyw`.
+- "Running on Linux" documentation covering the desktop UI, the headless `--export-analytics` workflow, and tray caveats.
+- Continuous-integration workflow that runs the smoke tests on Linux against Python 3.11 and 3.12.
+
+### Changed
+- `tzdata` is now installed on all platforms (previously Windows-only), fixing IANA time zone lookups on minimal Linux containers.
+- Time zone error messages are no longer Windows-specific.
+- `.venv` discovery in the source launchers now handles both Windows (`Lib/site-packages`, `Scripts`) and POSIX (`lib/pythonX.Y/site-packages`, `bin`) layouts.
+
 ## v10.6.0
 
 ### Added
