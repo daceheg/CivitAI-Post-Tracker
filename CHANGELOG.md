@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+- Buzz balance tracking. Each tracker run records a daily snapshot of the account's blue (earned), yellow (purchased), and green (generation) buzz balances from `buzz.getBuzzAccount`.
+- A **Buzz** dashboard workspace showing the current balance of each buzz type and the change since the previous snapshot.
+- `buzz_balance_snapshots` table and `options.enable_buzz_balance_tracking` config flag (default on; requires an API key).
+
 ## v10.6.0
 
 ### Added

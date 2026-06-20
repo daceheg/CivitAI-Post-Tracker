@@ -94,6 +94,20 @@ The Collections workspace uses compact cards instead of a stack of separate tabl
 
 Clicking a collection card opens the same detail drawer pattern used by the Performance tab, with image/post links and compact collection context.
 
+## Buzz
+
+The Buzz tab tracks your buzz balances over time. Each tracker run records one snapshot per day (UTC) when an API key is configured.
+
+The cards show the current balance of each buzz type, with the change since the previous snapshot:
+
+- **Blue buzz** — earned;
+- **Yellow buzz** — purchased;
+- **Green buzz** — generation.
+
+A final card shows how many snapshots have been collected and when the latest was taken. Deltas compare the latest snapshot to the previous one, so they reflect day-over-day movement rather than lifetime totals.
+
+Buzz tracking needs an API key and `options.enable_buzz_balance_tracking` (on by default). With no snapshots yet, the tab shows a short notice instead of cards.
+
 ## Timing
 
 The Timing tab starts with a compact board for scanning:

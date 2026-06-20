@@ -127,6 +127,7 @@ def default_config() -> dict[str, Any]:
             "start_auto_polling_on_launch": False,
             "check_updates_on_launch": True,
             "enable_collection_tracking": True,
+            "enable_buzz_balance_tracking": True,
         },
         "collection_tracking": {
             "account_type": "blue",

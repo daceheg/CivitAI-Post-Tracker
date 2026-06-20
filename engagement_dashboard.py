@@ -761,3 +761,113 @@ COLLECTION_SECTION_CSS = """
 @media (max-width:900px){.collection-board-grid{grid-template-columns:1fr}.collection-event-card{grid-template-columns:68px minmax(0,1fr)}.collection-event-status{grid-column:2;justify-self:start}.collection-panel-head{flex-direction:column}.collection-panel-head span{text-align:left}}
 </style>
 """
+
+
+# ------------------------------
+# Buzz balance section (PR-5)
+# ------------------------------
+
+def _fmt_signed(value: Optional[int]) -> str:
+    if value is None:
+        return "—"
+    return f"+{value}" if value > 0 else str(value)
+
+
+_BUZZ_KINDS = [
+    ("blue_balance", "Blue buzz", "Earned"),
+    ("yellow_balance", "Yellow buzz", "Purchased"),
+    ("green_balance", "Green buzz", "Generation"),
+]
+
+
+def get_buzz_balance_dashboard_data(db_path: str, history_limit: int = 60) -> Dict[str, Any]:
+    """Latest buzz balances + per-kind delta vs the previous snapshot."""
+    conn = sqlite3.connect(db_path)
+    try:
+        if not _table_has_columns(conn, "buzz_balance_snapshots", ["blue_balance", "captured_at"]):
+            return {"ok": False, "reason": "no_snapshots"}
+
+        rows = _fetch_all(
+            conn,
+            """
+            SELECT captured_at, blue_balance, green_balance, yellow_balance
+            FROM buzz_balance_snapshots
+            ORDER BY captured_at DESC
+            LIMIT ?
+            """,
+            (int(history_limit),),
+        )
+        if not rows:
+            return {"ok": False, "reason": "no_snapshots"}
+
+        latest = rows[0]
+        previous = rows[1] if len(rows) > 1 else None
+        # column index per balance key in the SELECT above
+        idx = {"blue_balance": 1, "green_balance": 2, "yellow_balance": 3}
+        balances: Dict[str, Optional[int]] = {}
+        deltas: Dict[str, Optional[int]] = {}
+        for key, i in idx.items():
+            balances[key] = latest[i]
+            if previous is not None and latest[i] is not None and previous[i] is not None:
+                deltas[key] = int(latest[i]) - int(previous[i])
+            else:
+                deltas[key] = None
+
+        return {
+            "ok": True,
+            "captured_at": latest[0],
+            "balances": balances,
+            "deltas": deltas,
+            "snapshot_count": len(rows),
+            "history": [(r[0], r[1], r[2], r[3]) for r in reversed(rows)],
+        }
+    except sqlite3.OperationalError as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+
+
+def render_buzz_balance_section_html(
+    db_path: str,
+    time_formatter: Optional[Callable[[Optional[str]], str]] = None,
+) -> str:
+    data = get_buzz_balance_dashboard_data(db_path)
+    if not data.get("ok"):
+        if data.get("reason") == "no_snapshots":
+            return (
+                "<div class='feature-note'>No buzz balance snapshots yet. "
+                "Buzz tracking records one snapshot per run once an API key is set.</div>"
+            )
+        return f"<div class='feature-note'>{_fmt(data.get('error'))}</div>"
+
+    balances = data.get("balances", {})
+    deltas = data.get("deltas", {})
+    cards = "".join(
+        _collection_metric(
+            label,
+            balances.get(key),
+            f"{sublabel} · change since last: {_fmt_signed(deltas.get(key))}",
+        )
+        for key, label, sublabel in _BUZZ_KINDS
+    )
+    cards += _collection_metric(
+        "Snapshots",
+        data.get("snapshot_count"),
+        f"Latest: {_fmt_time(data.get('captured_at'), time_formatter)}",
+    )
+
+    return (
+        "<div class='buzz-overview'>"
+        f"<div class='collection-kpis'>{cards}</div>"
+        "<div class='buzz-note'>Balances are snapshotted once per UTC day. "
+        "Deltas compare the latest snapshot to the previous one.</div>"
+        "</div>"
+    )
+
+
+BUZZ_SECTION_CSS = """
+<style>
+.buzz-overview{overflow:visible}
+.buzz-note{margin-top:14px;color:var(--muted);font-size:12px}
+</style>
+"""

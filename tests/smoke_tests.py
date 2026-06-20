@@ -1415,5 +1415,85 @@ class DashboardSmokeTests(unittest.TestCase):
         self.assertNotIn("<table", rendered)
 
 
+class BuzzBalanceTrackingSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.db = str(smoke_path("buzz_balance", ".db"))
+
+    def test_parse_buzz_balances_uses_confirmed_shape(self):
+        import buzz_balance_ingest as bb
+
+        parsed = bb.parse_buzz_balances({"blue": 100, "green": 50, "yellow": 200})
+        self.assertEqual(parsed["blue_balance"], 100)
+        self.assertEqual(parsed["green_balance"], 50)
+        self.assertEqual(parsed["yellow_balance"], 200)
+
+    def test_parse_tolerates_missing_fields(self):
+        import buzz_balance_ingest as bb
+
+        parsed = bb.parse_buzz_balances({})
+        self.assertIsNone(parsed["blue_balance"])
+        self.assertIsNone(parsed["yellow_balance"])
+
+    def test_snapshot_write_and_daily_dedupe(self):
+        import buzz_balance_ingest as bb
+
+        fields = {"blue_balance": 10, "green_balance": 20, "yellow_balance": 30}
+        self.assertTrue(bb.write_snapshot(self.db, fields, captured_at="2026-06-19T08:00:00Z"))
+        # later balance same UTC day -> deduped (no new row)
+        self.assertFalse(
+            bb.write_snapshot(
+                self.db,
+                {"blue_balance": 11, "green_balance": 20, "yellow_balance": 30},
+                captured_at="2026-06-19T20:00:00Z",
+            )
+        )
+        conn = sqlite3.connect(self.db)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM buzz_balance_snapshots").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)
+
+    def test_run_buzz_balance_ingest_skips_without_api_key(self):
+        import buzz_balance_ingest as bb
+
+        summary = bb.run_buzz_balance_ingest({}, self.db)
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary.get("reason"), "API key required")
+        self.assertFalse(Path(self.db).exists())
+
+    def test_dashboard_section_shows_balances_and_deltas(self):
+        import buzz_balance_ingest as bb
+        from engagement_dashboard import get_buzz_balance_dashboard_data, render_buzz_balance_section_html
+
+        bb.write_snapshot(
+            self.db,
+            {"blue_balance": 100, "green_balance": 50, "yellow_balance": 200},
+            captured_at="2026-06-18T00:00:00Z",
+        )
+        bb.write_snapshot(
+            self.db,
+            {"blue_balance": 137, "green_balance": 50, "yellow_balance": 180},
+            captured_at="2026-06-19T00:00:00Z",
+        )
+
+        data = get_buzz_balance_dashboard_data(self.db)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["deltas"]["blue_balance"], 37)
+        self.assertEqual(data["deltas"]["yellow_balance"], -20)
+        self.assertEqual(data["deltas"]["green_balance"], 0)
+
+        rendered = render_buzz_balance_section_html(self.db)
+        self.assertIn("Blue buzz", rendered)
+        self.assertIn("+37", rendered)
+        self.assertIn("-20", rendered)
+
+    def test_dashboard_section_handles_no_snapshots(self):
+        from engagement_dashboard import render_buzz_balance_section_html
+
+        rendered = render_buzz_balance_section_html(self.db)
+        self.assertIn("No buzz balance snapshots yet", rendered)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
