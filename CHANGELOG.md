@@ -3,7 +3,13 @@
 ## Unreleased
 
 ### Fixed
+- Post reaction totals are now derived by summing per-image stats for each post instead of reading the post-level rollup, which was stale and frequently reported zero reactions for recent posts. Totals now reflect current reaction counts on every run, including older posts whose reactions change over time.
 - Dashboard **Day** period filter now uses a rolling 24-hour window, matching the Week/Month/Year filters. Brand-new posts published shortly before local midnight are no longer dropped from the Day view at the day boundary.
+
+### Changed
+- Image fetching is scoped to the posts in the tracking window (batched by post ID and fetched in parallel) rather than pulling the whole catalog, and post pagination now stops early once it passes the tracking window, so runs over a small window are substantially faster.
+- Rate-limited (HTTP 429) and transient server (5xx) responses are retried with backoff, honoring `Retry-After`. When an image fetch is incomplete, the affected per-post totals fall back to the post rollup and are flagged rather than shown as zero.
+- The dashboard now reports where each post's totals came from (summed image stats vs. post rollup) instead of naming a single fixed source.
 
 ## v10.6.0
 

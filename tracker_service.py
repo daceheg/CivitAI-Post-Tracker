@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
@@ -295,6 +296,66 @@ def trpc_get(session: requests.Session, host: str, procedure: str, payload: Dict
     return body
 
 
+# Status codes worth retrying: rate limiting and transient server errors.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+RETRY_MAX_ATTEMPTS = 4
+RETRY_BASE_DELAY_SECONDS = 1.5
+RETRY_MAX_DELAY_SECONDS = 30.0
+
+
+def _retry_after_seconds(exc: requests.HTTPError) -> Optional[float]:
+    """Parse a Retry-After header (seconds form) from a 429/503 response, if present."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    value = resp.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None  # HTTP-date form not supported; fall back to backoff
+
+
+def trpc_get_with_retry(
+    session: requests.Session,
+    host: str,
+    procedure: str,
+    payload: Dict[str, Any],
+    timeout: int,
+) -> Dict[str, Any]:
+    """trpc_get with backoff on rate-limit (429) and transient 5xx errors.
+
+    Honors Retry-After on 429 when given in seconds; otherwise uses capped exponential
+    backoff. Non-retryable errors (4xx other than 429) raise immediately. Raises the
+    last error after exhausting attempts so callers can decide to skip/flag.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            return trpc_get(session=session, host=host, procedure=procedure, payload=payload, timeout=timeout)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status not in RETRYABLE_STATUS:
+                raise
+            last_exc = exc
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                break
+            delay = _retry_after_seconds(exc)
+            if delay is None:
+                delay = min(RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), RETRY_MAX_DELAY_SECONDS)
+            print(f"  {procedure}: HTTP {status}, retrying in {delay:.1f}s (attempt {attempt}/{RETRY_MAX_ATTEMPTS})")
+            time.sleep(delay)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                break
+            delay = min(RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), RETRY_MAX_DELAY_SECONDS)
+            print(f"  {procedure}: {type(exc).__name__}, retrying in {delay:.1f}s (attempt {attempt}/{RETRY_MAX_ATTEMPTS})")
+            time.sleep(delay)
+    raise last_exc if last_exc else RuntimeError(f"{procedure} failed on {host}")
+
+
 def make_post_payload(username: str, cursor: Any = None) -> Dict[str, Any]:
     payload = {
         "json": {
@@ -315,21 +376,33 @@ def make_post_payload(username: str, cursor: Any = None) -> Dict[str, Any]:
     return payload
 
 
-def make_image_payload(username: str, cursor: Any = None, with_meta: bool = True) -> Dict[str, Any]:
-    payload = {
-        "json": {
-            "useIndex": True,
-            "period": "AllTime",
-            "sort": "Newest",
-            "withMeta": with_meta,
-            "fromPlatform": False,
-            "browsingLevel": 31,
-            "include": ["cosmetics"],
-            "types": ["image"],
-            "username": username,
-            "cursor": cursor,
-        }
+def make_image_payload(
+    username: Optional[str] = None,
+    cursor: Any = None,
+    with_meta: bool = True,
+    post_ids: Optional[Sequence[int]] = None,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    json_payload: Dict[str, Any] = {
+        "useIndex": True,
+        "period": "AllTime",
+        "sort": "Newest",
+        "withMeta": with_meta,
+        "fromPlatform": False,
+        "browsingLevel": 31,
+        "include": ["cosmetics"],
+        "types": ["image"],
+        "cursor": cursor,
     }
+    # Scope by explicit post IDs (preferred: cost scales with tracked posts) or, for the
+    # legacy whole-catalog path, by username.
+    if post_ids is not None:
+        json_payload["postIds"] = [int(pid) for pid in post_ids]
+    if username is not None:
+        json_payload["username"] = username
+    if limit is not None:
+        json_payload["limit"] = int(limit)
+    payload: Dict[str, Any] = {"json": json_payload}
     if cursor is None:
         payload["meta"] = {"values": {"cursor": ["undefined"]}}
     return payload
@@ -342,14 +415,35 @@ def fetch_trpc_infinite(
     payload_factory,
     timeout: int,
     max_pages: int = 100,
-) -> List[dict]:
+    partial_ok: bool = False,
+) -> Tuple[List[dict], bool]:
+    """Page through a tRPC infinite query. Returns (items, completed).
+
+    Per-page requests retry on 429/5xx with backoff (trpc_get_with_retry).
+    `completed` is True only when we reached the natural end of the cursor; False if we
+    stopped early at `max_pages` or (when `partial_ok`) a page ultimately failed. With
+    `partial_ok=False` a page failure raises (so choose_working_host can fall back to
+    another host); with `partial_ok=True` we keep what we fetched and stop — image
+    fetches use this so a transient error degrades to flagged-partial data, not nothing.
+    """
     items: List[dict] = []
     cursor: Any = None
     seen_cursors: set = set()
+    completed = False
 
     for _ in range(max_pages):
         payload = payload_factory(cursor)
-        body = trpc_get(session=session, host=host, procedure=procedure, payload=payload, timeout=timeout)
+        try:
+            body = trpc_get_with_retry(session=session, host=host, procedure=procedure, payload=payload, timeout=timeout)
+        except Exception as exc:
+            if partial_ok:
+                print(
+                    f"WARNING: {procedure} failed on a page ({exc}); keeping "
+                    f"{len(items)} items already fetched, marked incomplete."
+                )
+                break
+            raise
+
         batch = body.get("items", [])
         if not isinstance(batch, list):
             raise RuntimeError(f"Unexpected items type for {procedure} on {host}")
@@ -357,6 +451,74 @@ def fetch_trpc_infinite(
             if isinstance(item, dict):
                 item.setdefault("_source_host", host)
         items.extend([item for item in batch if isinstance(item, dict)])
+
+        next_cursor = body.get("nextCursor")
+        if next_cursor is None:
+            completed = True
+            break
+        cursor_key = json.dumps(next_cursor, sort_keys=True, ensure_ascii=False, default=str)
+        if cursor_key in seen_cursors:
+            completed = True
+            break
+        seen_cursors.add(cursor_key)
+        cursor = next_cursor
+        time.sleep(REQUEST_PAGE_DELAY_SECONDS)
+
+    if not completed and items:
+        print(
+            f"WARNING: {procedure} stopped before exhausting results "
+            f"({len(items)} items fetched, max_pages={max_pages}). Per-post totals may be incomplete."
+        )
+
+    return items, completed
+
+
+def fetch_posts_trpc(
+    session: requests.Session,
+    host: str,
+    username: str,
+    timeout: int,
+    tz_helper: Optional["TimezoneHelper"] = None,
+    min_post_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    max_pages: int = 100,
+) -> List[dict]:
+    """Page post.getInfinite (Newest-sorted). If a tracking window is given, stop paging
+    once an entire page falls outside it — posts are descending, so older pages can't
+    re-enter the window. This avoids paging the whole catalog (the run's real bottleneck:
+    ~15s for 2200 posts vs ~0.3s for the scoped image fetch) when only recent posts are
+    tracked. With no window, behaves as a full fetch.
+    """
+    have_window = tz_helper is not None and (min_post_id is not None or start_date)
+    items: List[dict] = []
+    cursor: Any = None
+    seen_cursors: set = set()
+
+    for _ in range(max_pages):
+        body = trpc_get_with_retry(
+            session=session, host=host, procedure="post.getInfinite",
+            payload=make_post_payload(username=username, cursor=cursor), timeout=timeout,
+        )
+        batch = body.get("items", [])
+        if not isinstance(batch, list):
+            raise RuntimeError(f"Unexpected items type for post.getInfinite on {host}")
+        page_items = [it for it in batch if isinstance(it, dict)]
+        for it in page_items:
+            it.setdefault("_source_host", host)
+        items.extend(page_items)
+
+        if have_window and page_items:
+            assert tz_helper is not None
+            page_has_tracked = any(
+                passes_start_filter(
+                    safe_int(it.get("id") or it.get("postId")) or -1,
+                    it.get("publishedAt") or it.get("createdAt") or it.get("updatedAt"),
+                    tz_helper, min_post_id, start_date,
+                )
+                for it in page_items
+            )
+            if not page_has_tracked:
+                break  # entire page is older than the window; nothing newer remains below
 
         next_cursor = body.get("nextCursor")
         if next_cursor is None:
@@ -371,24 +533,82 @@ def fetch_trpc_infinite(
     return items
 
 
-def fetch_posts_trpc(session: requests.Session, host: str, username: str, timeout: int) -> List[dict]:
-    return fetch_trpc_infinite(
-        session=session,
-        host=host,
-        procedure="post.getInfinite",
-        payload_factory=lambda cursor: make_post_payload(username=username, cursor=cursor),
-        timeout=timeout,
-    )
+# Per-post reaction totals are summed from image stats. Fetch images scoped to the posts
+# we track (not the whole catalog) by batching their IDs into image.getInfinite?postIds=.
+# Cost scales with tracked posts, not total catalog size.
+IMAGE_POST_ID_CHUNK = 100      # post IDs per image.getInfinite request
+IMAGE_PAGE_LIMIT = 200         # max accepted page size (limit=500 -> HTTP 400)
+IMAGE_CHUNK_MAX_PAGES = 100    # pagination safety cap within a single chunk
+LARGE_SCOPE_POST_WARNING = 500  # warn the run may be slow above this many tracked posts
+DEFAULT_IMAGE_FETCH_WORKERS = 4  # parallel chunk fetchers; 429s are retried/backed off
 
 
-def fetch_images_trpc(session: requests.Session, host: str, username: str, timeout: int) -> List[dict]:
+def chunked(seq: Sequence[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(seq), size):
+        yield list(seq[i:i + size])
+
+
+def _fetch_image_chunk(api_key: Optional[str], host: str, chunk: List[int], timeout: int, with_meta: bool) -> Tuple[List[dict], bool]:
+    """Fetch one chunk's images on its OWN session (workers share no state).
+
+    Each chunk holds a disjoint set of post IDs, so concurrent chunk fetches never
+    touch shared data; giving each its own Session removes any thread-safety concern.
+    Pagination within a chunk is sequential (cursor-driven).
+    """
+    session = requests.Session()
+    session.headers.update(build_headers(api_key))
     return fetch_trpc_infinite(
         session=session,
         host=host,
         procedure="image.getInfinite",
-        payload_factory=lambda cursor: make_image_payload(username=username, cursor=cursor, with_meta=True),
+        payload_factory=lambda cursor, c=chunk: make_image_payload(
+            cursor=cursor, with_meta=with_meta, post_ids=c, limit=IMAGE_PAGE_LIMIT
+        ),
         timeout=timeout,
+        max_pages=IMAGE_CHUNK_MAX_PAGES,
+        partial_ok=True,
     )
+
+
+def fetch_images_for_posts(
+    api_key: Optional[str],
+    host: str,
+    post_ids: Sequence[int],
+    timeout: int,
+    with_meta: bool = True,
+    workers: int = DEFAULT_IMAGE_FETCH_WORKERS,
+) -> Tuple[List[dict], bool]:
+    """Fetch images for a specific set of posts, batched by postIds and fetched with a
+    bounded thread pool (parallelism across chunks; pagination within a chunk stays
+    sequential). Each worker uses its own Session over a disjoint chunk of post IDs.
+
+    Returns (image_items, completed). `completed` is False if any chunk failed or
+    stopped early, so callers can flag image-derived totals as possibly incomplete.
+    """
+    ids = [int(pid) for pid in post_ids]
+    if not ids:
+        return [], True
+
+    chunks = list(chunked(ids, IMAGE_POST_ID_CHUNK))
+    pool_size = max(1, min(workers, len(chunks)))
+
+    all_items: List[dict] = []
+    completed = True
+
+    if pool_size == 1:
+        for chunk in chunks:
+            items, chunk_done = _fetch_image_chunk(api_key, host, chunk, timeout, with_meta)
+            all_items.extend(items)
+            completed = completed and chunk_done
+        return all_items, completed
+
+    with ThreadPoolExecutor(max_workers=pool_size) as executor:
+        futures = [executor.submit(_fetch_image_chunk, api_key, host, chunk, timeout, with_meta) for chunk in chunks]
+        for future in as_completed(futures):
+            items, chunk_done = future.result()
+            all_items.extend(items)
+            completed = completed and chunk_done
+    return all_items, completed
 
 
 def rest_fetch_images(session: requests.Session, host: str, username: str, timeout: int, nsfw_level: str) -> List[dict]:
@@ -417,11 +637,17 @@ def choose_working_host(
     hosts: Sequence[str],
     username: str,
     timeout: int,
+    tz_helper: Optional["TimezoneHelper"] = None,
+    min_post_id: Optional[int] = None,
+    start_date: Optional[str] = None,
 ) -> Tuple[str, List[dict]]:
     errors: List[str] = []
     for host in hosts:
         try:
-            posts = fetch_posts_trpc(session=session, host=host, username=username, timeout=timeout)
+            posts = fetch_posts_trpc(
+                session=session, host=host, username=username, timeout=timeout,
+                tz_helper=tz_helper, min_post_id=min_post_id, start_date=start_date,
+            )
             if posts:
                 return host, posts
             errors.append(f"{host}: returned 0 posts")
@@ -446,6 +672,120 @@ def stats_are_known(stats: object) -> bool:
     if not isinstance(stats, dict):
         return False
     return any(get_stat_or_none(stats, key) is not None for key in STAT_KEYS)
+
+
+# Map of canonical post-stat key -> the spellings it can appear under across sources.
+# tRPC image.getInfinite uses the ...AllTime suffix; REST /api/v1/images and
+# post.getInfinite use the bare key. Aggregation must tolerate both.
+IMAGE_STAT_KEY_ALIASES = {
+    "likeCount": ("likeCount", "likeCountAllTime"),
+    "heartCount": ("heartCount", "heartCountAllTime"),
+    "laughCount": ("laughCount", "laughCountAllTime"),
+    "cryCount": ("cryCount", "cryCountAllTime"),
+    "commentCount": ("commentCount", "commentCountAllTime"),
+}
+
+
+def get_image_stat_or_none(stats: object, canonical_key: str) -> Optional[int]:
+    """Read one stat from an image's stats block, tolerant of suffixed/unsuffixed keys."""
+    if not isinstance(stats, dict):
+        return None
+    for alias in IMAGE_STAT_KEY_ALIASES.get(canonical_key, (canonical_key,)):
+        value = get_stat_or_none(stats, alias)
+        if value is not None:
+            return value
+    return None
+
+
+def reconcile_post_stats(
+    rollup: Dict[str, Optional[int]],
+    image_sum: Optional[Dict[str, int]],
+    images_complete: bool = True,
+) -> Tuple[Dict[str, Optional[int]], str]:
+    """Choose per-post reaction stats, preferring fresh image-sum over the stale rollup.
+
+    `rollup` holds the post.getInfinite stats (like/heart/laugh/cry/comment counts,
+    any of which may be None when the rollup is missing). `image_sum` is the
+    per-post total from aggregate_image_stats_by_post, or None when the post has no
+    images.
+
+    Preference order (keeps every existing fallback, just adds a preferred source):
+      1. fresh  : image-sum, when present and trustworthy
+      2. rollup : post.getInfinite stats, when image-sum is absent or untrustworthy
+
+    Defensive zero-guard: image stats have degraded to all-zeros before. If the
+    image-sum is all zero but the rollup reports a non-zero reaction, the image
+    source is likely broken for this post, so we keep the rollup rather than
+    overwrite good data with zeros. Returns (chosen_stats, source_label).
+    """
+    if not image_sum or image_sum.get("_image_count", 0) <= 0:
+        return rollup, "rollup"
+
+    fresh = {key: int(image_sum.get(key, 0) or 0) for key in STAT_KEYS}
+    fresh_reactions = fresh["likeCount"] + fresh["heartCount"] + fresh["laughCount"] + fresh["cryCount"]
+
+    rollup_reactions = sum(
+        int(rollup.get(key) or 0)
+        for key in ("likeCount", "heartCount", "laughCount", "cryCount")
+    )
+
+    # Zero-guard: don't clobber a non-zero rollup with an all-zero image-sum.
+    if fresh_reactions == 0 and rollup_reactions > 0:
+        return rollup, "rollup_zero_guard"
+
+    # Catalog under-fetched: still prefer the (likely-better) fresh sum, but tag it so
+    # the dashboard/consumer knows the per-post total may be incomplete.
+    if not images_complete:
+        return fresh, "image_sum_incomplete"
+
+    return fresh, "image_sum"
+
+
+def describe_stats_sources(counts: Dict[str, int]) -> str:
+    """Human-readable summary of where post reaction totals came from this run.
+
+    e.g. "image stats (40 posts), post rollup (4)" or, with degraded fetches,
+    "image stats (38), post rollup (4), image stats — incomplete fetch (2)".
+    """
+    if not counts:
+        return "No posts processed"
+    labels = {
+        "image_sum": "image stats",
+        "image_sum_incomplete": "image stats (incomplete fetch)",
+        "rollup": "post rollup",
+        "rollup_zero_guard": "post rollup (image stats looked empty)",
+    }
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{labels.get(src, src)} ({n})" for src, n in ordered)
+
+
+def aggregate_image_stats_by_post(images: List[dict]) -> Dict[int, Dict[str, int]]:
+    """Sum per-image reaction/comment stats into per-post totals.
+
+    Returns {post_id: {likeCount, heartCount, laughCount, cryCount, commentCount,
+    _image_count}}. Only posts with at least one image appear. Missing per-image
+    stat values count as 0 (an image with no reactions contributes nothing), but
+    a post whose images yield no readable stat at all is still represented so the
+    reconciler can apply the defensive zero-guard against the post rollup.
+    """
+    totals: Dict[int, Dict[str, int]] = {}
+    for item in images:
+        if not isinstance(item, dict):
+            continue
+        post_id = safe_int(item.get("postId") or item.get("post_id"))
+        if post_id is None:
+            continue
+        stats = item.get("stats")
+        bucket = totals.setdefault(
+            post_id,
+            {key: 0 for key in STAT_KEYS} | {"_image_count": 0},
+        )
+        bucket["_image_count"] += 1
+        for key in STAT_KEYS:
+            value = get_image_stat_or_none(stats, key)
+            if value is not None:
+                bucket[key] += value
+    return totals
 
 
 def safe_int(value: Any) -> Optional[int]:
@@ -690,18 +1030,29 @@ def extract_image_metadata(item: dict) -> Dict[str, Any]:
     }
 
 
-def normalize_post(item: dict, username: str) -> Optional[dict]:
+def normalize_post(
+    item: dict,
+    username: str,
+    image_stats_by_post: Optional[Dict[int, Dict[str, int]]] = None,
+    images_complete: bool = True,
+) -> Optional[dict]:
     post_id = safe_int(item.get("id") or item.get("postId"))
     if post_id is None:
         return None
 
-    stats = item.get("stats")
-    like_count = get_stat_or_none(stats, "likeCount")
-    heart_count = get_stat_or_none(stats, "heartCount")
-    laugh_count = get_stat_or_none(stats, "laughCount")
-    cry_count = get_stat_or_none(stats, "cryCount")
-    comment_count = get_stat_or_none(stats, "commentCount")
-    known = stats_are_known(stats)
+    # The post.getInfinite stats block is the stale PostMetric rollup; it zeros out
+    # for recently published posts. Prefer fresh per-post totals summed from image
+    # stats when available, falling back to the rollup (see reconcile_post_stats).
+    rollup = {key: get_stat_or_none(item.get("stats"), key) for key in STAT_KEYS}
+    image_sum = (image_stats_by_post or {}).get(post_id)
+    chosen, stats_source = reconcile_post_stats(rollup, image_sum, images_complete=images_complete)
+
+    like_count = chosen.get("likeCount")
+    heart_count = chosen.get("heartCount")
+    laugh_count = chosen.get("laughCount")
+    cry_count = chosen.get("cryCount")
+    comment_count = chosen.get("commentCount")
+    known = stats_are_known(chosen)
 
     reaction_total = None
     engagement_total = None
@@ -727,6 +1078,7 @@ def normalize_post(item: dict, username: str) -> Optional[dict]:
         "published_at": published_at,
         "source_host": item.get("_source_host"),
         "stats_known": 1 if known else 0,
+        "stats_source": stats_source,
         "like_count": like_count,
         "heart_count": heart_count,
         "laugh_count": laugh_count,
@@ -850,6 +1202,25 @@ def passes_start_filter(
     return True
 
 
+def select_tracked_post_ids(
+    posts: List[dict],
+    tz_helper: TimezoneHelper,
+    min_post_id: Optional[int],
+    start_date: Optional[str],
+) -> List[int]:
+    """Post IDs that pass the start filter — the set we fetch images for. Mirrors the
+    filtering process_posts applies, so image fetching is scoped to exactly what we track."""
+    ids: List[int] = []
+    for item in posts:
+        post_id = safe_int(item.get("id") or item.get("postId"))
+        if post_id is None:
+            continue
+        published_at = item.get("publishedAt") or item.get("createdAt") or item.get("updatedAt")
+        if passes_start_filter(post_id, published_at, tz_helper, min_post_id, start_date):
+            ids.append(post_id)
+    return ids
+
+
 def process_posts(
     conn: sqlite3.Connection,
     posts: List[dict],
@@ -857,14 +1228,22 @@ def process_posts(
     min_post_id: Optional[int],
     start_date: Optional[str],
     source_kind: str,
-) -> Tuple[int, int, Set[int]]:
+    image_stats_by_post: Optional[Dict[int, Dict[str, int]]] = None,
+    images_complete: bool = True,
+) -> Tuple[int, int, Set[int], Dict[str, int]]:
     captured_at = utc_now_iso()
     changed_count = 0
     tracked_count = 0
     tracked_post_ids: Set[int] = set()
+    stats_source_counts: Dict[str, int] = defaultdict(int)
 
     for item in posts:
-        row = normalize_post(item=item, username=item.get("username") or "")
+        row = normalize_post(
+            item=item,
+            username=item.get("username") or "",
+            image_stats_by_post=image_stats_by_post,
+            images_complete=images_complete,
+        )
         if row is None:
             continue
         if not passes_start_filter(row["post_id"], row["published_at"], tz_helper, min_post_id, start_date):
@@ -872,6 +1251,7 @@ def process_posts(
 
         tracked_count += 1
         tracked_post_ids.add(int(row["post_id"]))
+        stats_source_counts[row.get("stats_source", "rollup")] += 1
         prev = get_latest_post_snapshot(conn, row["post_id"])
         insert_post_snapshot(conn, row=row, captured_at=captured_at, source_kind=source_kind)
 
@@ -919,7 +1299,7 @@ def process_posts(
             )
 
     conn.commit()
-    return tracked_count, changed_count, tracked_post_ids
+    return tracked_count, changed_count, tracked_post_ids, dict(stats_source_counts)
 
 
 def replace_post_images(conn: sqlite3.Connection, images: List[dict], allowed_post_ids: Set[int]) -> int:
@@ -2324,6 +2704,7 @@ def render_dashboard(
     start_date: Optional[str],
     runtime_status_path: Optional[str] = None,
     db_path: Optional[str] = None,
+    stats_source_label: Optional[str] = None,
 ) -> None:
     current_posts = get_current_posts(conn)
     images_map = get_post_images_map(conn)
@@ -3498,7 +3879,8 @@ def render_dashboard(
     parts.append(metric_card("Tracked posts", str(tracked_posts), tracking_window))
     parts.append(metric_card("Known totals", str(known_totals), "Posts with usable stats"))
     parts.append(metric_card("Unknown totals", str(unknown_totals), "Posts without usable stats"))
-    parts.append(metric_card("Data source", data_source_label, "tRPC post.getInfinite"))
+    stats_source_sub = html.escape(stats_source_label) if stats_source_label else "Post totals from image stats"
+    parts.append(metric_card("Data source", data_source_label, stats_source_sub))
     parts.append(metric_card("Last capture", html.escape(tz_helper.fmt_dt(latest_capture)), "Latest snapshot time"))
     parts.append("</div>")
 
@@ -3687,6 +4069,7 @@ def run_once(
     timeout: int,
     allow_rest_fallback: bool,
     runtime_status_path: Optional[str] = None,
+    image_fetch_workers: int = DEFAULT_IMAGE_FETCH_WORKERS,
 ) -> Dict[str, Any]:
     tz_helper = TimezoneHelper(tz_name)
     conn = db_connect(db_path)
@@ -3696,27 +4079,60 @@ def run_once(
 
     try:
         init_db(conn)
-        selected_host, post_items = choose_working_host(session=session, hosts=hosts, username=username, timeout=timeout)
-        tracked_posts, changed_posts, tracked_post_ids = process_posts(
+        selected_host, post_items = choose_working_host(
+            session=session, hosts=hosts, username=username, timeout=timeout,
+            tz_helper=tz_helper, min_post_id=min_post_id, start_date=start_date,
+        )
+
+        # Fetch images BEFORE processing posts: per-post reaction totals are derived by
+        # summing image stats (fresh) and only fall back to the post.getInfinite rollup
+        # (stale/zero for recent posts) when images are missing or look degraded.
+        # Scope the image fetch to the posts we actually track so cost scales with the
+        # tracked set, not the whole catalog.
+        tracked_ids = select_tracked_post_ids(post_items, tz_helper, min_post_id, start_date)
+        if len(tracked_ids) >= LARGE_SCOPE_POST_WARNING:
+            print(
+                f"NOTE: refreshing image stats for {len(tracked_ids)} tracked posts; "
+                f"this run may take a while. Narrow the tracking start point to speed it up."
+            )
+
+        image_source = "trpc_image.getInfinite"
+        image_fetch_completed = False
+        try:
+            image_items, image_fetch_completed = fetch_images_for_posts(
+                api_key=api_key, host=selected_host, post_ids=tracked_ids,
+                timeout=timeout, workers=image_fetch_workers,
+            )
+        except Exception as exc:
+            if not allow_rest_fallback:
+                print(f"Image enrichment skipped: {exc}")
+                image_items = []
+            else:
+                print(f"Scoped image fetch failed, trying REST fallback: {exc}")
+                try:
+                    image_items = rest_fetch_images(session=session, host=selected_host, username=username, timeout=timeout, nsfw_level=nsfw_level)
+                    image_source = "rest_api_v1_images"
+                    image_fetch_completed = True
+                except Exception as rest_exc:
+                    print(f"REST image fallback also failed: {rest_exc}; using post rollup totals only.")
+                    image_items = []
+
+        image_stats_by_post = aggregate_image_stats_by_post(image_items)
+
+        # Trust image-summed totals only when the scoped fetch completed cleanly. If any
+        # chunk failed or stopped early, flag totals as possibly incomplete.
+        images_complete = image_fetch_completed
+
+        tracked_posts, changed_posts, tracked_post_ids, stats_source_counts = process_posts(
             conn=conn,
             posts=post_items,
             tz_helper=tz_helper,
             min_post_id=min_post_id,
             start_date=start_date,
             source_kind="trpc_post.getInfinite",
+            image_stats_by_post=image_stats_by_post,
+            images_complete=images_complete,
         )
-
-        image_source = "trpc_image.getInfinite"
-        try:
-            image_items = fetch_images_trpc(session=session, host=selected_host, username=username, timeout=timeout)
-        except Exception as exc:
-            if not allow_rest_fallback:
-                print(f"Image enrichment skipped: {exc}")
-                image_items = []
-            else:
-                print(f"tRPC image fetch failed, trying REST fallback: {exc}")
-                image_items = rest_fetch_images(session=session, host=selected_host, username=username, timeout=timeout, nsfw_level=nsfw_level)
-                image_source = "rest_api_v1_images"
 
         image_rows = replace_post_images(conn=conn, images=image_items, allowed_post_ids=tracked_post_ids)
         export_csvs(conn=conn, csv_dir=csv_dir, tz_helper=tz_helper)
@@ -3731,6 +4147,7 @@ def run_once(
             start_date=start_date,
             runtime_status_path=str(Path(runtime_status_path).resolve()) if runtime_status_path else None,
             db_path=db_path,
+            stats_source_label=describe_stats_sources(stats_source_counts),
         )
 
         current_posts = get_current_posts(conn)

@@ -11,6 +11,9 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -32,8 +35,12 @@ from tracker_app import build_first_run_config, format_elapsed_time, format_next
 from tracker_runner import TrackerRunner
 from tracker_service import (
     TimezoneHelper,
+    aggregate_image_stats_by_post,
     build_post_performance_rows,
+    describe_stats_sources,
     export_analytics_dataset,
+    fetch_images_for_posts,
+    fetch_posts_trpc,
     get_current_posts,
     init_db,
     load_post_deltas,
@@ -41,7 +48,9 @@ from tracker_service import (
     make_image_payload,
     normalize_image,
     normalize_post,
+    reconcile_post_stats,
     render_dashboard,
+    trpc_get_with_retry,
     utc_now,
     write_dashboard_html,
 )
@@ -1465,6 +1474,267 @@ class DashboardSmokeTests(unittest.TestCase):
         self.assertNotIn("Image not matched", rendered)
         self.assertNotIn("Recent mapped activity", rendered)
         self.assertNotIn("<table", rendered)
+
+
+class PostStatImageSumSmokeTests(unittest.TestCase):
+    """Post reaction totals are derived from fresh image stats, not the stale
+    post.getInfinite rollup, with fallbacks preserved (see FINDINGS.md / PR-1)."""
+
+    def test_aggregate_tolerates_suffixed_and_unsuffixed_keys(self) -> None:
+        # image.getInfinite uses ...AllTime suffix; REST /api/v1/images does not.
+        images = [
+            {"postId": 100, "stats": {"likeCountAllTime": 29, "heartCountAllTime": 2}},
+            {"postId": 100, "stats": {"likeCountAllTime": 12, "heartCountAllTime": 0}},
+            {"postId": 200, "stats": {"likeCount": 19, "heartCount": 6}},
+        ]
+        agg = aggregate_image_stats_by_post(images)
+        self.assertEqual(agg[100]["likeCount"], 41)
+        self.assertEqual(agg[100]["heartCount"], 2)
+        self.assertEqual(agg[100]["_image_count"], 2)
+        self.assertEqual(agg[200]["likeCount"], 19)
+
+    def test_prefers_fresh_image_sum_over_zeroed_rollup(self) -> None:
+        # The core bug: rollup zeros out for recent posts; image-sum is correct.
+        post = {"id": 1, "title": "t", "stats": {
+            "likeCount": 0, "heartCount": 0, "laughCount": 0, "cryCount": 0, "commentCount": 0}}
+        agg = aggregate_image_stats_by_post([{"postId": 1, "stats": {"likeCountAllTime": 29}}])
+        row = normalize_post(item=post, username="acct", image_stats_by_post=agg)
+        self.assertEqual(row["like_count"], 29)
+        self.assertEqual(row["stats_source"], "image_sum")
+        self.assertEqual(row["stats_known"], 1)
+
+    def test_zero_guard_keeps_nonzero_rollup_when_images_all_zero(self) -> None:
+        # If image stats degrade to all-zero but the rollup is non-zero, keep the rollup.
+        rollup = {"likeCount": 15, "heartCount": 3, "laughCount": 0, "cryCount": 0, "commentCount": 1}
+        all_zero = {k: 0 for k in ("likeCount", "heartCount", "laughCount", "cryCount", "commentCount")}
+        all_zero["_image_count"] = 5
+        chosen, source = reconcile_post_stats(rollup, all_zero)
+        self.assertEqual(source, "rollup_zero_guard")
+        self.assertEqual(chosen["likeCount"], 15)
+
+    def test_falls_back_to_rollup_when_no_images(self) -> None:
+        post = {"id": 2, "title": "t", "stats": {
+            "likeCount": 5, "heartCount": 1, "laughCount": 0, "cryCount": 0, "commentCount": 2}}
+        row = normalize_post(item=post, username="acct", image_stats_by_post={})
+        self.assertEqual(row["like_count"], 5)
+        self.assertEqual(row["stats_source"], "rollup")
+
+    def test_incomplete_fetch_uses_fresh_but_flags_it(self) -> None:
+        post = {"id": 3, "title": "t", "stats": {
+            "likeCount": 0, "heartCount": 0, "laughCount": 0, "cryCount": 0, "commentCount": 0}}
+        agg = aggregate_image_stats_by_post([{"postId": 3, "stats": {"likeCountAllTime": 29}}])
+        row = normalize_post(item=post, username="acct", image_stats_by_post=agg, images_complete=False)
+        self.assertEqual(row["like_count"], 29)
+        self.assertEqual(row["stats_source"], "image_sum_incomplete")
+
+    def test_metadata_still_comes_from_post_object(self) -> None:
+        post = {"id": 4, "title": "My Post", "publishedAt": "2026-06-01T00:00:00Z",
+                "stats": {"likeCount": 0, "heartCount": 0, "laughCount": 0, "cryCount": 0, "commentCount": 0}}
+        agg = aggregate_image_stats_by_post([{"postId": 4, "stats": {"likeCountAllTime": 7}}])
+        row = normalize_post(item=post, username="acct", image_stats_by_post=agg)
+        self.assertEqual(row["title"], "My Post")
+        self.assertEqual(row["published_at"], "2026-06-01T00:00:00Z")
+
+    def test_describe_stats_sources_is_human_readable(self) -> None:
+        label = describe_stats_sources({"image_sum": 40, "rollup": 4})
+        self.assertIn("image stats (40)", label)
+        self.assertIn("post rollup (4)", label)
+        self.assertEqual(describe_stats_sources({}), "No posts processed")
+
+
+def _http_error(status: int, retry_after: str | None = None) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status
+    if retry_after is not None:
+        response.headers["Retry-After"] = retry_after
+    return requests.HTTPError(f"HTTP {status}", response=response)
+
+
+class FetchRetrySmokeTests(unittest.TestCase):
+    """Retry/backoff in trpc_get_with_retry (time.sleep patched so tests are fast)."""
+
+    def test_retries_429_then_succeeds(self) -> None:
+        calls: list[int] = []
+
+        def fake_trpc_get(**kwargs):
+            calls.append(1)
+            if len(calls) < 3:
+                raise _http_error(429)
+            return {"items": [{"id": 1}]}
+
+        with mock.patch("tracker_service.trpc_get", side_effect=fake_trpc_get), \
+                mock.patch("tracker_service.time.sleep") as sleep:
+            body = trpc_get_with_retry(
+                session=object(), host="https://civitai.red",
+                procedure="post.getInfinite", payload={}, timeout=5,
+            )
+
+        self.assertEqual(body, {"items": [{"id": 1}]})
+        self.assertEqual(len(calls), 3)          # failed twice, succeeded on third
+        self.assertEqual(sleep.call_count, 2)    # one backoff per retry
+
+    def test_retries_transient_5xx(self) -> None:
+        calls: list[int] = []
+
+        def fake_trpc_get(**kwargs):
+            calls.append(1)
+            if len(calls) < 2:
+                raise _http_error(503)
+            return {"items": []}
+
+        with mock.patch("tracker_service.trpc_get", side_effect=fake_trpc_get), \
+                mock.patch("tracker_service.time.sleep"):
+            trpc_get_with_retry(
+                session=object(), host="https://civitai.red",
+                procedure="image.getInfinite", payload={}, timeout=5,
+            )
+        self.assertEqual(len(calls), 2)
+
+    def test_non_retryable_4xx_raises_immediately(self) -> None:
+        calls: list[int] = []
+
+        def fake_trpc_get(**kwargs):
+            calls.append(1)
+            raise _http_error(404)
+
+        with mock.patch("tracker_service.trpc_get", side_effect=fake_trpc_get), \
+                mock.patch("tracker_service.time.sleep") as sleep:
+            with self.assertRaises(requests.HTTPError):
+                trpc_get_with_retry(
+                    session=object(), host="https://civitai.red",
+                    procedure="post.getInfinite", payload={}, timeout=5,
+                )
+        self.assertEqual(len(calls), 1)          # no retry on 404
+        sleep.assert_not_called()
+
+    def test_honors_retry_after_header_on_429(self) -> None:
+        calls: list[int] = []
+
+        def fake_trpc_get(**kwargs):
+            calls.append(1)
+            if len(calls) < 2:
+                raise _http_error(429, retry_after="7")
+            return {"items": []}
+
+        with mock.patch("tracker_service.trpc_get", side_effect=fake_trpc_get), \
+                mock.patch("tracker_service.time.sleep") as sleep:
+            trpc_get_with_retry(
+                session=object(), host="https://civitai.red",
+                procedure="post.getInfinite", payload={}, timeout=5,
+            )
+        sleep.assert_called_once_with(7.0)       # used Retry-After, not exponential backoff
+
+
+class FetchPostsEarlyStopSmokeTests(unittest.TestCase):
+    """fetch_posts_trpc stops paging once a full page falls outside the tracked window."""
+
+    @staticmethod
+    def _pages():
+        # Page 1: tracked (ids >= 1000). Page 2: entirely older (ids < 1000) -> stop here.
+        # Page 3 must never be requested when a window is supplied.
+        return {
+            None: {"items": [{"id": 1001, "publishedAt": "2026-06-10T00:00:00Z"},
+                             {"id": 1000, "publishedAt": "2026-06-09T00:00:00Z"}],
+                   "nextCursor": "c1"},
+            "c1": {"items": [{"id": 999, "publishedAt": "2026-05-01T00:00:00Z"},
+                             {"id": 998, "publishedAt": "2026-04-01T00:00:00Z"}],
+                   "nextCursor": "c2"},
+            "c2": {"items": [{"id": 1, "publishedAt": "2026-01-01T00:00:00Z"}],
+                   "nextCursor": None},
+        }
+
+    def _fake_trpc_get_factory(self, pages, requested):
+        def fake_trpc_get(*, session, host, procedure, payload, timeout):
+            cursor = payload["json"]["cursor"]
+            requested.append(cursor)
+            return pages[cursor]
+        return fake_trpc_get
+
+    def test_stops_early_with_window(self) -> None:
+        pages = self._pages()
+        requested: list = []
+        with mock.patch("tracker_service.trpc_get",
+                        side_effect=self._fake_trpc_get_factory(pages, requested)), \
+                mock.patch("tracker_service.time.sleep"):
+            items = fetch_posts_trpc(
+                session=object(), host="https://civitai.red", username="tester", timeout=5,
+                tz_helper=TimezoneHelper("UTC"), min_post_id=1000,
+            )
+        # Requested page 1 (None) and page 2 ("c1"); page 2 was all-untracked so we stop.
+        self.assertEqual(requested, [None, "c1"])
+        self.assertNotIn("c2", requested)
+        self.assertEqual([it["id"] for it in items], [1001, 1000, 999, 998])
+
+    def test_full_fetch_without_window(self) -> None:
+        pages = self._pages()
+        requested: list = []
+        with mock.patch("tracker_service.trpc_get",
+                        side_effect=self._fake_trpc_get_factory(pages, requested)), \
+                mock.patch("tracker_service.time.sleep"):
+            items = fetch_posts_trpc(
+                session=object(), host="https://civitai.red", username="tester", timeout=5,
+            )
+        self.assertEqual(requested, [None, "c1", "c2"])   # no window -> page to the end
+        self.assertEqual(len(items), 5)
+
+
+class FetchImagesConcurrencySmokeTests(unittest.TestCase):
+    """fetch_images_for_posts: concurrent and sequential paths agree; partial flags."""
+
+    @staticmethod
+    def _images_for(post_ids):
+        # One image per post, single page per chunk (nextCursor None).
+        return {"items": [{"id": 9000 + pid, "postId": pid} for pid in post_ids],
+                "nextCursor": None}
+
+    def _fake_trpc_get(self, *, session, host, procedure, payload, timeout):
+        return self._images_for(payload["json"]["postIds"])
+
+    def test_concurrent_and_sequential_agree(self) -> None:
+        post_ids = list(range(1, 251))          # 250 ids -> 3 chunks of 100/100/50
+        with mock.patch("tracker_service.trpc_get", side_effect=self._fake_trpc_get), \
+                mock.patch("tracker_service.time.sleep"):
+            concurrent, c_done = fetch_images_for_posts(
+                api_key=None, host="https://civitai.red", post_ids=post_ids, timeout=5, workers=4,
+            )
+            sequential, s_done = fetch_images_for_posts(
+                api_key=None, host="https://civitai.red", post_ids=post_ids, timeout=5, workers=1,
+            )
+
+        self.assertTrue(c_done)
+        self.assertTrue(s_done)
+        self.assertEqual(len(concurrent), 250)
+        # Order may differ under concurrency; compare as sets of postIds (accuracy locked).
+        self.assertEqual(
+            sorted(img["postId"] for img in concurrent),
+            sorted(img["postId"] for img in sequential),
+        )
+        self.assertEqual(sorted(img["postId"] for img in concurrent), post_ids)
+
+    def test_empty_post_ids_short_circuits(self) -> None:
+        with mock.patch("tracker_service.trpc_get") as trpc:
+            items, completed = fetch_images_for_posts(
+                api_key=None, host="https://civitai.red", post_ids=[], timeout=5,
+            )
+        self.assertEqual(items, [])
+        self.assertTrue(completed)
+        trpc.assert_not_called()
+
+    def test_chunk_failure_marks_incomplete(self) -> None:
+        def fake_trpc_get(*, session, host, procedure, payload, timeout):
+            ids = payload["json"]["postIds"]
+            if 150 in ids:                       # fail the second chunk on every page
+                raise _http_error(404)
+            return self._images_for(ids)
+
+        with mock.patch("tracker_service.trpc_get", side_effect=fake_trpc_get), \
+                mock.patch("tracker_service.time.sleep"):
+            items, completed = fetch_images_for_posts(
+                api_key=None, host="https://civitai.red",
+                post_ids=list(range(1, 201)), timeout=5, workers=2,
+            )
+        self.assertFalse(completed)              # partial_ok keeps what succeeded, flags incomplete
+        self.assertEqual(sorted(img["postId"] for img in items), list(range(1, 101)))
 
 
 if __name__ == "__main__":

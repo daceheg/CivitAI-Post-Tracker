@@ -126,6 +126,8 @@ Removing the key does not hide rows already stored in the local database. It onl
 
 Dashboard periods use the configured local timezone. The Day, Week, Month, and Year filters are rolling windows ending at the current time (last 24 hours, 7 days, 30 days, 365 days) — not calendar boundaries.
 
+Each post's reaction totals are summed from the stats of that post's images, fetched fresh on every run. This reflects current reaction counts even on older posts, whose totals can keep changing over time. When images for a post cannot be fetched, the dashboard falls back to the post-level total and marks it accordingly; the data-source note shows how many posts used summed image stats versus the fallback.
+
 The header includes a `generated ...` timestamp. If the dashboard looks stale, run the tracker again and confirm that timestamp changed.
 
 The dashboard page auto-refreshes itself every 5 minutes. This reloads the local HTML view; it does not trigger a tracker run or fetch new CivitAI data. Background polling is controlled by the app's polling interval.
